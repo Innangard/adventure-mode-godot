@@ -28,6 +28,15 @@ var nop= WebSocketMultiplayerPeer.new()
 var connection_level : Dictionary[int, String] = {0:""}
 var peer_type : Dictionary[int, String] = {0:"",1:"main"}
 
+## SECTION Death and respawn vars
+## What happens to a player after they die. Only RESPAWN does anything right now,
+## the multiplayer groups issue fills in the other two
+enum DeathBehavior {RESPAWN, DISCONNECT, AWAIT_TPK}
+var host_rest_level_path : String = "" # level of the host's last bonfire, empty means the host never rested
+var host_rest_node_path : NodePath # path from that level's root to the bonfire's world_rest_and_reset node
+var respawn_pending : bool = false # on while we load a level just to respawn, level_start checks it
+## !SECTION
+
 # Attempts to find an available port by trying to create a temp ENet server.
 func find_available_port(start_port: int, end_port: int) -> int:
 	for p in range(start_port, end_port + 1):
@@ -225,6 +234,7 @@ func add_player_OLD(peer_id):
 func add_player(peer_id : int):
 	print("%d:Add player" % multiplayer.get_unique_id())
 	bring_player_in_to_the_game_or_something.rpc_id(peer_id, connection_level, peer_type, MgrTransition.current_level.resource_path, "spawn_1")
+	share_host_rest.rpc_id(peer_id, host_rest_level_path, host_rest_node_path) # late joiners need to know the host's bonfire too
 
 @rpc
 func bring_player_in_to_the_game_or_something(everyonealreadyhereandwheretheyare : Dictionary, peer_types : Dictionary, your_start_level : String, your_spawn_point : String):
@@ -276,6 +286,8 @@ func _on_server_disconnected():
 	print(str(multiplayer.get_unique_id()) + " called _on_server_disconnected")
 	MgrTransition.target_spawn_point = ''
 	MgrPlayerSocket.player_type = "main" # reset player type for their home
+	host_rest_level_path = "" # forget the old host's bonfire, it's not our world anymore
+	respawn_pending = false
 	MgrTransition.change_scene_to_pack(preload("res://scenes/title_scene.tscn")) 
 	# did not want to use level_transition, to let it grow to have other functionality
 
@@ -354,3 +366,59 @@ func spawn_me_in_coach(connection : int) -> void:
 	get_tree().current_scene.spawned_players.append(new_player)
 	new_player.visible = false
 	#take_guy.rpc(bute, connection)
+
+
+# SECTION Death and respawn
+# Flow: local player dies -> actor waits 5 sec -> handle_local_death picks a behavior
+# for our player type -> RESPAWN puts us back at the bonfire or a spawn point.
+# Everything runs on the dead player's own machine, the host doesn't referee anything yet.
+
+## Picks what happens when a player of this type dies. This is the one spot to change
+## when invaders should get booted or summons should wait for a total party kill
+func get_death_behavior(player_type : String) -> DeathBehavior:
+	if player_type == "main":
+		return DeathBehavior.RESPAWN
+	elif player_type == "ally":
+		return DeathBehavior.RESPAWN
+	elif player_type == "enemy":
+		return DeathBehavior.RESPAWN # no disconnects yet so invaders can test
+	return DeathBehavior.RESPAWN
+
+
+## Actor calls this once the local player has been dead for 5 sec
+func handle_local_death(me : Actor):
+	var behavior : DeathBehavior = get_death_behavior(MgrPlayerSocket.player_type)
+	if behavior == DeathBehavior.RESPAWN:
+		respawn_local_player(me)
+	elif behavior == DeathBehavior.DISCONNECT:
+		push_warning("DISCONNECT on death isn't hooked up yet, respawning instead")
+		respawn_local_player(me)
+	elif behavior == DeathBehavior.AWAIT_TPK:
+		push_warning("AWAIT_TPK on death isn't hooked up yet, respawning instead")
+		respawn_local_player(me)
+
+
+## Gets our own player back up. Host and co-op go to the host's bonfire (even in another level),
+## invaders go to a multiplayer spawn point in the level they're in
+func respawn_local_player(me : Actor):
+	var level : Level = get_tree().current_scene
+	var is_invader : bool = MgrPlayerSocket.player_type == "enemy"
+	var has_bonfire : bool = host_rest_level_path != ""
+
+	if is_invader == false and has_bonfire and host_rest_level_path != MgrTransition.current_level.resource_path:
+		# Bonfire's in another level, load it and level_start places us since respawn_pending is on
+		respawn_pending = true
+		MgrTransition.level_transition(host_rest_level_path, "respawn") # name doesn't matter, it just can't be empty or level_start never runs
+		return
+
+	# Same level, no reload, just put us in the right spot and stand back up
+	level.place_player_for_respawn(me)
+	me.revive()
+
+
+## Host sends this out whenever it rests, and to anybody who joins, so everyone knows the host's bonfire
+@rpc("authority", "reliable")
+func share_host_rest(level_path : String, node_path : NodePath):
+	host_rest_level_path = level_path
+	host_rest_node_path = node_path
+# !SECTION

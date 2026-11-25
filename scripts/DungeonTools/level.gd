@@ -73,7 +73,11 @@ func level_start():
 		dup.outfit_load(MgrPlayerSocket.player_outfit)
 
 	# find spawn point:
-	if MgrTransition.target_spawn_point != "":
+	if MgrMultiplayer.respawn_pending:
+		# We died and loaded this level just to get back to the host's bonfire
+		MgrMultiplayer.respawn_pending = false
+		place_player_for_respawn(new_player)
+	elif MgrTransition.target_spawn_point != "":
 		print(MgrTransition.target_spawn_point)
 		## FIXME - Hack for indader spawns 
 		if MgrPlayerSocket.player_type == "enemy":
@@ -124,7 +128,63 @@ func level_start():
 	await get_tree().create_timer(1).timeout
 	MgrTransition.msg_big(name, 3)
 
-## Rest at fire, respawn enemies, pass time, etc. 
+## Puts our respawning local player in the right spot for their type and moves the camera.
+## Host and co-op: host's bonfire, or the spawn point we came in through if the host never rested.
+## Invaders: a multiplayer spawn point, or the spawn point we came in through if there isn't one.
+func place_player_for_respawn(player : Actor):
+	var slot : int = get_respawn_slot()
+	var spawn = null
+	if MgrTransition.target_spawn_point != "":
+		spawn = find_child(MgrTransition.target_spawn_point) # the spawn point we came in through
+
+	if MgrPlayerSocket.player_type == "enemy":
+		var mp_spawn = find_multiplayer_spawn_point()
+		if mp_spawn != null:
+			spawn = mp_spawn
+	else:
+		var fire = null
+		if MgrMultiplayer.host_rest_level_path == MgrTransition.current_level.resource_path:
+			fire = get_node_or_null(MgrMultiplayer.host_rest_node_path) # path is relative to the level root, which is us
+		if fire != null:
+			fire.spawn_player_at_checkpoint(player, slot)
+			move_camera_behind(player)
+			return
+
+	if spawn != null:
+		# Line people up sideways from the spawn point so nobody's stacked on each other
+		player.global_transform = spawn.global_transform
+		player.global_position += spawn.global_basis.x * (slot * 1.5)
+	else:
+		push_warning("Couldn't find a respawn spot, using last saved position")
+		player.global_transform = MgrPlayerSocket.player_last_saved_pos
+	player.velocity = Vector3.ZERO
+	move_camera_behind(player)
+
+
+## Our spot in line when respawning, from our id's place in the sorted list of everybody connected.
+## Just keeps people from standing inside each other
+func get_respawn_slot() -> int:
+	var ids : Array[int] = [multiplayer.get_unique_id()]
+	ids.append_array(multiplayer.get_peers())
+	ids.sort()
+	return ids.find(multiplayer.get_unique_id())
+
+
+## First spawn point in this level marked as a multiplayer spawn, or null if there isn't one
+func find_multiplayer_spawn_point():
+	for node in find_children("*"):
+		if node is Spawnpoint3D and node.subtype == Spawnpoint3D.Subtype.MULTIPLAYER:
+			return node
+	return null
+
+
+## Same camera swing as the spawn point code in level_start
+func move_camera_behind(player : Actor):
+	var psock = MgrPlayerSocket.get_player_one()
+	psock.ganty_thing.global_position = player.global_position + (player.global_basis.z * 10) + Vector3(0,5,0)
+	psock.ganty_thing.look_at(player.global_position)
+
+## Rest at fire, respawn enemies, pass time, etc.
 func reset_level_now():
 	print("Whooosh, reset sound! And respawn enemies n shit.")
 	level_reset.emit()

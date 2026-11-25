@@ -30,8 +30,6 @@ var lock_targ_pos : Vector3 = Vector3.ZERO
 # animation set NAME
 # These hold nodes that need to be updated with various values
 # See apply_animation_params to behold the shame
-enum AnSet { BLOCK, MOVE, TURN, JUMP }
-var anim_param_groups : Dictionary[String,Array] 
 var aset_BLOCK = []
 var aset_MOVE = []
 var aset_TURN = []
@@ -78,8 +76,6 @@ signal attack_hit(actor_hit, attack_id)
 
 @onready var start_pos = global_position
 
-@export var test_mvpk : MovementPackage
-
 func _enter_tree() -> void:
 	ALL_EVER_MADE.append(self)
 	$MultiplayerSynchronizer.add_visibility_filter(MgrMultiplayer.visibility_filter)
@@ -97,23 +93,31 @@ func _ready():
 	dress_up()
 
 	if len(movement_sets) > 0:
-		for arm in character.hand_right_slots:
-			if arm.moveset not in movement_sets:
-				movement_sets.append(arm.moveset)
 		compile_new_anim_tree()
 
-	animation_tree.active = true # tree is stored off to stop constant minor animation changes in github
+	# FIXME - Workaround for offhand item not being unique
+	#var narr : Array[InventoryItem] = []
+	#for x in character.hand_left_slots:
+	#	narr.append(x.duplicate_deep(Resource.DEEP_DUPLICATE_ALL))
+	#character.hand_left_slots = narr
 
 
 ## Spawn or Respawn setup
 func spawn():
 	character.reset()
-	global_position = start_pos
+	# no teleport to start_pos anymore, whoever calls this already put us in the right spot
 	character.alive = true
 	animation_tree.active = true
 	current_moveset = 0
 	animation_tree["parameters/playback"].travel(movement_sets[current_moveset].name)
-	pass 
+	pass
+
+
+## Gets this actor back on their feet after dying, used for the local player and everybody else's copies
+func revive():
+	$skeleton/AnimationPlayer.stop() # kill the death anim so the tree can take back over
+	action_q.clear() # don't come back still doing whatever was queued when we died
+	spawn()
 
 
 func find_hurtboxes_recursive(node : Node):
@@ -135,15 +139,6 @@ func enthrall():
 
 
 func _process(delta):
-	if Input.is_action_just_pressed("p1_event_action"):
-		if test_mvpk in movement_sets:
-			print("REMOVE!")
-			_mvpk_remove(test_mvpk)
-			movement_sets.pop_back()
-		else:
-			print("ADD!")
-			movement_sets.append(test_mvpk)
-			_mvpk_add(test_mvpk)
 	action_q_process()
 	if character.health_current <= 0 and character.alive == true:
 		# NOTE - A special case for death seems fine
@@ -152,12 +147,18 @@ func _process(delta):
 		$skeleton/AnimationPlayer.play("death")
 		velocity = Vector3.ZERO
 		emit_signal("actor_killed", self) # NOTE: added for dungeon tools demo
-		if name == "PLAYER|1":
+		# Our own player: lie there for 5 sec, then MgrMultiplayer decides what happens (respawn for now)
+		if is_in_group("local_player"):
 			await get_tree().create_timer(5).timeout
-			MgrTransition.level_transition(MgrTransition.current_level.resource_path, "spawn_start")
+			if is_inside_tree(): # level could've changed while we were lying there
+				MgrMultiplayer.handle_local_death(self)
 		#spawn()
-		
-		
+
+
+	# Somebody else's player: their health coming back over the network means they respawned
+	if character.alive == false and is_multiplayer_authority() == false and name.begins_with("PLAYER|") and character.health_current > 0:
+		revive()
+
 	if character.alive == false:
 		return
 	character.stats_regen(delta)
@@ -194,22 +195,23 @@ func _physics_process(_delta):
 
 
 func apply_animation_params():
-	# NOTE - This is a hack, i'll detail how it works. All animator parameters are iterated through,
-	# their names are checked for certain keys.	Each key implies (ugh) a certain value type
-	# Example, MOVE will be given the vector2 desired move. Others to come. It's awful, I know. 
-	if len(movement_sets) == 0:
-		return
+	# NOTE - This is a hack, i'll detail how it works.
+	# all animator parameters are iterated through,
+	# their names are checked for certain keys.
+	# Each key implies (ugh) a certain value type
+	# Example, MOVE will be given the vector2 desired move
+	# Others to come. It's awful, I know. 
+
 	# SECTION Our current things, computing them once: 
 	var tmd =  Vector2(( global_basis.inverse() * -desired_move).x,-( global_basis.inverse() * -desired_move).z)
 	transformed_move_dir = lerp(transformed_move_dir, tmd, 0.25)
-	var param_group = anim_param_groups[movement_sets[current_moveset].name]
-	for ani in param_group[AnSet.BLOCK]:
+	for ani in aset_BLOCK:
 		animation_tree.set(ani, 1 if "block" in action_q.keys() else 0)
-	for ani in  param_group[AnSet.MOVE]:
+	for ani in aset_MOVE:
 		animation_tree.set(ani, transformed_move_dir)
-	for ani in  param_group[AnSet.TURN]:			
+	for ani in aset_TURN:			
 		animation_tree.set(ani, desired_turn)
-	for ani in  param_group[AnSet.JUMP]:
+	for ani in aset_JUMP:
 		animation_tree.set(ani, 1 if desired_move.y > 0.5 else 0)
 	# !SECTION
 
@@ -262,11 +264,6 @@ func movement_package_checks():
 @rpc
 func net_anim_pack_change(pack : int):
 	#print("Current: %d, Remote: %d" % [current_moveset, pack])
-	if pack >= len(movement_sets):
-		push_warning("RPC Anim package index out of range, moving to 0")
-		current_moveset = 0
-		animation_tree["parameters/playback"].travel(movement_sets[current_moveset].name)
-		return
 	if pack != current_moveset:
 		#print("Gotta swap them bad boys!")
 		current_moveset = pack
@@ -324,14 +321,12 @@ func right_item_inc(move : int) -> void:
 	
 ## Moves <move> around the item array, wraps around array length
 func left_item_inc(move : int) -> void:
-	if character.get_num_hand_l() == 0:
+	if len(character.hand_left_slots) == 0:
 		return
 	#unequip thing if thing 
-	var accessory : Accessory
-	if character.hand_l_current != -1:
-		accessory = character.hand_left_slots[character.hand_l_current].held_item
-		dup.accessory_unequip(accessory)
-	if character.get_num_hand_l() == 1 and character.hand_l_current == 0:
+	var accessory : Accessory = character.hand_left_slots[character.hand_l_current].held_item
+	dup.accessory_unequip(accessory)
+	if len(character.hand_left_slots) == 1 and character.hand_l_current == 0:
 		character.hand_l_current = -1
 		return
 	else:
@@ -391,80 +386,60 @@ func block_attack(id : int):
 
 
 func compile_new_anim_tree():
-	# Create new animation tree
-	animation_tree.tree_root = AnimationNodeStateMachine.new()
-	animation_tree.tree_root.state_machine_type = AnimationNodeStateMachine.STATE_MACHINE_TYPE_NESTED
-	# TODO - Recompile list of movement packs from equipment n stuff. 
-
-	# Add animation sets
+	var master_tree = AnimationNodeStateMachine.new()
+	master_tree.state_machine_type = AnimationNodeStateMachine.STATE_MACHINE_TYPE_NESTED
+	var counter = 0
+	## FIXME - Hard coded adding in movement sets from weapons
+	for arm in character.hand_right_slots:
+		if arm.moveset not in movement_sets:
+			movement_sets.append(arm.moveset)
 	for mvpk in movement_sets:
-		_mvpk_add(mvpk)
+		master_tree.add_node(mvpk.name, mvpk.anim_tree.duplicate(true), Vector2(0, counter))
 
-	# Start Playback
-	animation_tree["parameters/playback"].start(movement_sets[0].name)
-
-func _mvpk_add(pk : MovementPackage):	
-	# Add pack
-	animation_tree.tree_root.add_node(pk.name, pk.anim_tree.duplicate(true), Vector2(0, 0))
-	# Add transitions
 	var masterstate_transition = AnimationNodeStateMachineTransition.new()
 	masterstate_transition.advance_mode = AnimationNodeStateMachineTransition.ADVANCE_MODE_ENABLED
 	masterstate_transition.xfade_time = 0.1
-	# Get sets that have already been added
-	var current_nodes = animation_tree.tree_root.get_node_list()
-	for cur in current_nodes:
-		if cur == pk.name or cur == "Start" or cur == "End":
-			continue
-		animation_tree.tree_root.add_transition(pk.name, cur, masterstate_transition.duplicate())
-		animation_tree.tree_root.add_transition(cur, pk.name, masterstate_transition.duplicate())
-	# Walk only this node and get params or something 
-	var params = animation_tree.get_property_list()
-	#print(params)
-	#assert(false, "Stop here")
-	# Array of arrays using enum AnSet - Animation Set (verb)
-	var p_array : Array = [[],[],[],[]]
+	for mvpk in movement_sets:
+		for othermove in movement_sets:
+			if mvpk == othermove:
+				continue
+			master_tree.add_transition(mvpk.name, othermove.name, masterstate_transition.duplicate())
 
-	#enum AnSet { BLOCK, MOVE, TURN, JUMP }
+	animation_tree.tree_root = master_tree # neat. What? No transitions or anything
+	var state_machine = animation_tree["parameters/playback"]
+	#state_machine.travel()
+	state_machine.start(movement_sets[0].name)
 
-	for item in params:
-		if item.name.begins_with("parameters/"+ pk.name + "/"):
+	# Initialize default values
+	# NOTE - This is a hack.
+	# This iterates through paramiter names, then extracts default values from them, and applies them
+	# This is a hack, because little things like speeds or blends are saved on the animated thing,
+	# Not in the animation tree 
+	var param_names = animation_tree.get_property_list() #._get_parameter_list()
+	for item in param_names: # not actually param names now, still trying to get a list'
+		if item.name.begins_with("parameters/"):
 			if item.name.contains("SET_F["):
 				var workstring = item.name.substr(item.name.find('[')+1)
 				workstring = workstring.replace("-", ".") # NOTE - Another hack, param names cant have dots
 				workstring = workstring.substr(0, workstring.find(']'))
 				animation_tree.set(item.name, workstring.to_float())
-			elif item.name.contains("BLOCK"):
-				p_array[AnSet.BLOCK].append(item.name)
 			elif item.name.contains("MOVE") and item.name.contains("blend_position"):
-				p_array[AnSet.MOVE].append(item.name)
+				aset_MOVE.append(item.name)
 			elif item.name.contains("TURN") and (item.name.contains("blend_position") or item.name.contains("add_amount")):				
-				p_array[AnSet.TURN].append(item.name)
-			elif item.name.contains("JUMP"): 
-				p_array[AnSet.JUMP].append(item.name)
-	anim_param_groups[pk.name] = p_array
+				aset_TURN.append(item.name)
+			elif item.name.contains("BLOCK"): # and item.name.contains("blend_position"):
+				aset_BLOCK.append(item.name)
+			elif item.name.contains("JUMP"): # and item.name.contains("blend_position"):
+				aset_JUMP.append(item.name)
+		# This is a fix for the T-posing walk/sprint problem. 
+		# There is some error in nexted AnimationStateMachines automatically playing
+		# So here we manually call the problem child and start it.
+		# TODO - Make more generic, or find the cause of the error in starting
+		if item.name.contains("WalkSprint/playback"):
+				animation_tree.get(item.name).travel("Start")
+	animation_tree.active = true # set here to stop minor bone movement from showing up over and over again in git
 
-
-
-func _mvpk_remove(pk : MovementPackage):
-	# Move to default package if we are in this one
-	if pk == movement_sets[current_moveset]:
-		current_moveset = 0
-		animation_tree["parameters/playback"].travel(movement_sets[current_moveset].name)
-		net_anim_pack_change.rpc(current_moveset)
-	# Get the node in there
-	var tree = animation_tree.tree_root as AnimationNodeStateMachine
-	# Remove all transitions
-	var nodes = tree.get_node_list()
-	for node in nodes:
-		if node == pk.name:
-			continue
-		tree.remove_transition(node, pk.name)
-		tree.remove_transition(pk.name, node)
-	# Remove Node
-	tree.remove_node(pk.name)
-	# Cleanup anim params
-	anim_param_groups.erase(pk.name)
-
+	#animation_tree.connect("animation_finished", cb)
 func cb(msg : String):
 	print("CB MSG: " + msg)
 
@@ -643,9 +618,12 @@ func multiplayer_despawn():
 func multiplayer_spawn():
 	#print("Spawn point: " + MgrTransition.target_spawn_point)
 	#print("Spawn logic: " + str(get_tree().current_scene))
-	var spawnpoint : Spawnpoint3D = (get_tree().current_scene as Level).find_child(MgrTransition.target_spawn_point)
+	var spawnpoint = (get_tree().current_scene as Level).find_child(MgrTransition.target_spawn_point)
 	#print("Spawn subtp: " + str(spawnpoint.subtype))
-	rpc_mp_spawn.rpc(MgrPlayerSocket.player_type, spawnpoint.subtype) 
+	var spawn_anim : int = 0 # plain spawn anim when there's no real spawn point, like respawning at a bonfire
+	if spawnpoint is Spawnpoint3D:
+		spawn_anim = spawnpoint.subtype
+	rpc_mp_spawn.rpc(MgrPlayerSocket.player_type, spawn_anim)
 
 @rpc("call_local")
 func rpc_mp_spawn(player_type : String, anim : int):
@@ -684,7 +662,7 @@ func net_sync(d_move : Vector3, c_rotation : Vector3, c_position : Vector3, c_sp
 	sprint = c_sprint
 	character.health_current = c_health
 	hand_state = c_hand_state as HandState
-	if c_mvpk != current_moveset and c_mvpk < len(movement_sets):
+	if c_mvpk != current_moveset:
 		current_moveset = c_mvpk
 		var state_machine = animation_tree["parameters/playback"]
 		state_machine.travel(movement_sets[current_moveset].name)
